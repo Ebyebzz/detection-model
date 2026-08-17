@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, Response
+from flask import Flask, request, render_template_string, jsonify
 import torch
 from torchvision import transforms
 from PIL import Image
@@ -6,6 +6,10 @@ import io
 import base64
 import cv2
 import numpy as np
+import os
+
+# Optimize PyTorch to use fewer resources on cloud servers
+torch.set_num_threads(1)
 
 app = Flask(__name__)
 
@@ -15,8 +19,6 @@ app = Flask(__name__)
 MODEL_PATH = "perfect_coffee_model.pth" 
 CONFIDENCE_THRESHOLD = 0.70
 
-# Must remain 4 classes to prevent PyTorch from crashing, 
-# but "Dark" is now excluded from the visual counts.
 CLASS_NAMES = [
     "Dark",
     "Green", 
@@ -27,19 +29,21 @@ CLASS_NAMES = [
 # ==========================================
 # 2. AI MODEL LOADING & PREPARATION
 # ==========================================
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cpu') 
 try:
-    model = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-    model.eval()
-    
-    num_classes = model.classifier[1].out_features
-    if len(CLASS_NAMES) < num_classes:
-        for i in range(len(CLASS_NAMES), num_classes):
-            CLASS_NAMES.append(f"Auto-Detected Class {i}")
-            
-    print(f"✅ AI Model loaded successfully on {device}! Expected {num_classes} classes.")
+    if os.path.exists(MODEL_PATH):
+        model = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        model.eval()
+        num_classes = model.classifier[1].out_features
+        if len(CLASS_NAMES) < num_classes:
+            for i in range(len(CLASS_NAMES), num_classes):
+                CLASS_NAMES.append(f"Auto-Detected Class {i}")
+        print(f"✅ AI Model loaded successfully! Expected {num_classes} classes.")
+    else:
+        print(f"⚠️ Model file '{MODEL_PATH}' not found in directory.")
+        model = None
 except Exception as e:
-    print(f"⚠️ Error loading AI model: {e}. The system will not function correctly without it.")
+    print(f"⚠️ Error loading AI model: {e}")
     model = None
 
 infer_transform = transforms.Compose([
@@ -49,12 +53,13 @@ infer_transform = transforms.Compose([
 ])
 
 # ==========================================
-# 3. AI-DRIVEN BATCH & LIVE LOGIC
+# 3. HYBRID BATCH LOGIC (AI + COLOR FALLBACK)
 # ==========================================
 def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
     output_img = img_bgr.copy()
+    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     
-    # 1. Isolate objects using Watershed
+    # 1. Isolate objects using Watershed Algorithm
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -75,14 +80,12 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
     
     cv2.watershed(img_bgr, markers)
     
-    red_count = 0
-    yellow_count = 0
-    green_count = 0
-    invalid_count = 0
-    min_bean_area = 400 
+    red_count, yellow_count, green_count, invalid_count = 0, 0, 0, 0
+    min_bean_area = 200 # Lowered slightly for better live webcam detection
     
     valid_crops_tensors = []
     boxes = []
+    masks = []
     
     # 2. Extract objects
     for label in np.unique(markers):
@@ -94,7 +97,7 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
         contours, _ = cv2.findContours(bean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if contours:
-            cnt = contours[0]
+            cnt = max(contours, key=cv2.contourArea) # Get the largest contour specifically
             area = cv2.contourArea(cnt)
             
             if area > min_bean_area:
@@ -113,51 +116,90 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
                 
                 valid_crops_tensors.append(tensor)
                 boxes.append((x, y, w, h))
+                masks.append(bean_mask)
 
-    # 3. AI Structure & Shape Verification
-    if valid_crops_tensors and model is not None:
-        batch_tensor = torch.stack(valid_crops_tensors).to(device)
-        
-        with torch.no_grad():
-            outputs = model(batch_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            max_probs, predicted_idxs = torch.max(probabilities, 1)
+    # 3. Verify and Draw (Crucial Fix: Handle Render Cloud Memory Drops)
+    if len(boxes) > 0:
+        if model is not None:
+            # --- AI CLASSIFICATION PATH ---
+            batch_tensor = torch.stack(valid_crops_tensors).to(device)
             
-        for i in range(len(valid_crops_tensors)):
-            prob = max_probs[i].item()
-            pred_idx = predicted_idxs[i].item()
-            x, y, w, h = boxes[i]
+            with torch.no_grad():
+                outputs = model(batch_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                max_probs, predicted_idxs = torch.max(probabilities, 1)
+                
+            for i in range(len(boxes)):
+                prob = max_probs[i].item()
+                pred_idx = predicted_idxs[i].item()
+                x, y, w, h = boxes[i]
+                
+                pred_class = CLASS_NAMES[pred_idx]
+                
+                if prob < CONFIDENCE_THRESHOLD or pred_class == "Dark":
+                    status, color = "Excluded", (150, 150, 150)
+                    invalid_count += 1
+                else:
+                    if pred_class == "Red":
+                        status, color = "Red", (0, 0, 255)
+                        red_count += 1
+                    elif pred_class == "Yellow":
+                        status, color = "Yellow", (0, 215, 255)
+                        yellow_count += 1
+                    elif pred_class == "Green":
+                        status, color = "Green", (0, 255, 0)
+                        green_count += 1
+                    else:
+                        status, color = pred_class, (200, 200, 200)
+
+                cv2.rectangle(output_img, (x, y), (x + w, y + h), color, 4)
+                label_text = f"{status} {prob*100:.0f}%"
+                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(output_img, (x, y - 20), (x + tw, y), color, -1)
+                text_color = (0, 0, 0) if status == "Yellow" else (255, 255, 255)
+                cv2.putText(output_img, label_text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+
+        else:
+            # --- FAILSAFE COLOR PATH ---
+            # If the PyTorch model failed to load (e.g. Render RAM limits), 
+            # gracefully fallback to pure Computer Vision to guarantee boxes are always drawn.
+            lower_red1, upper_red1 = np.array([0, 50, 50]), np.array([12, 255, 255])
+            lower_red2, upper_red2 = np.array([160, 50, 50]), np.array([179, 255, 255])
+            lower_yellow, upper_yellow = np.array([13, 50, 50]), np.array([30, 255, 255])
+            lower_green, upper_green = np.array([31, 40, 40]), np.array([95, 255, 255])
             
-            pred_class = CLASS_NAMES[pred_idx]
-            
-            # Relegated "Dark" to the invalid category alongside low-confidence shapes
-            if prob < CONFIDENCE_THRESHOLD or pred_class == "Dark":
-                status = "Excluded"
-                color = (150, 150, 150) # Grey BGR
-                invalid_count += 1
-            else:
-                if pred_class == "Red":
+            for i in range(len(boxes)):
+                x, y, w, h = boxes[i]
+                bean_mask = masks[i]
+                
+                mask_r1 = cv2.inRange(img_hsv, lower_red1, upper_red1)
+                mask_r2 = cv2.inRange(img_hsv, lower_red2, upper_red2)
+                mask_red = cv2.bitwise_and(cv2.bitwise_or(mask_r1, mask_r2), bean_mask)
+                mask_yellow = cv2.bitwise_and(cv2.inRange(img_hsv, lower_yellow, upper_yellow), bean_mask)
+                mask_green = cv2.bitwise_and(cv2.inRange(img_hsv, lower_green, upper_green), bean_mask)
+                
+                count_red = cv2.countNonZero(mask_red)
+                count_yellow = cv2.countNonZero(mask_yellow)
+                count_green = cv2.countNonZero(mask_green)
+                max_count = max(count_red, count_yellow, count_green)
+                
+                if max_count == count_red and count_red > 0:
                     status, color = "Red", (0, 0, 255)
                     red_count += 1
-                elif pred_class == "Yellow":
+                elif max_count == count_yellow and count_yellow > 0:
                     status, color = "Yellow", (0, 215, 255)
                     yellow_count += 1
-                elif pred_class == "Green":
+                else:
                     status, color = "Green", (0, 255, 0)
                     green_count += 1
-                else:
-                    status, color = pred_class, (200, 200, 200)
+                    
+                cv2.rectangle(output_img, (x, y), (x + w, y + h), color, 4)
+                label_text = f"{status} (CV Fallback)"
+                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(output_img, (x, y - 20), (x + tw, y), color, -1)
+                text_color = (0, 0, 0) if status == "Yellow" else (255, 255, 255)
+                cv2.putText(output_img, label_text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
 
-            # Draw bounding box and label
-            cv2.rectangle(output_img, (x, y), (x + w, y + h), color, 4)
-            label_text = f"{status} {prob*100:.0f}%"
-            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(output_img, (x, y - 20), (x + tw, y), color, -1)
-            
-            text_color = (0, 0, 0) if status == "Yellow" else (255, 255, 255)
-            cv2.putText(output_img, label_text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
-
-    # Live camera UI Panel (Dark removed)
     if draw_live_stats:
         cv2.rectangle(output_img, (10, 10), (180, 105), (0, 0, 0), -1)
         cv2.putText(output_img, f"Red: {red_count}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -167,35 +209,7 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
     return output_img, red_count, yellow_count, green_count, invalid_count
 
 # ==========================================
-# 4. WEBCAM STREAMING GENERATOR
-# ==========================================
-def generate_camera_frames():
-    camera = cv2.VideoCapture(0)
-    
-    if not camera.isOpened():
-        blank = np.zeros((480, 640, 3), np.uint8)
-        cv2.putText(blank, "Error: Web Camera Not Found", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        ret, buffer = cv2.imencode('.jpg', blank)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        return
-
-    try:
-        while True:
-            success, frame = camera.read()
-            if not success:
-                break
-            
-            annotated_frame, _, _, _, _ = process_coffee_batch_bgr(frame, draw_live_stats=True)
-            
-            ret, buffer = cv2.imencode('.jpg', annotated_frame)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    finally:
-        camera.release() 
-
-# ==========================================
-# 5. PREMIUM MINIMALIST HTML/CSS/JS UI
+# 4. PREMIUM HTML/CSS/JS UI
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -204,99 +218,43 @@ HTML_TEMPLATE = """
     <title>Analysis Center</title>
     <style>
         :root {
-            --bg-color: #fafafa;
-            --container-bg: #ffffff;
-            --text-main: #111111;
-            --text-muted: #666666;
-            --accent: #000000;
-            --border-light: #e0e0e0;
+            --bg-color: #fafafa; --container-bg: #ffffff;
+            --text-main: #111111; --text-muted: #666666;
+            --accent: #000000; --border-light: #e0e0e0;
         }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
-            background-color: var(--bg-color); color: var(--text-main); margin: 0; padding: 40px 20px; 
-            display: flex; justify-content: center;
-        }
-        .container { 
-            width: 100%; max-width: 600px; background: var(--container-bg); padding: 40px; 
-            border-radius: 2px; box-shadow: 0 10px 30px rgba(0,0,0,0.04); border: 1px solid var(--border-light);
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg-color); color: var(--text-main); margin: 0; padding: 40px 20px; display: flex; justify-content: center; }
+        .container { width: 100%; max-width: 600px; background: var(--container-bg); padding: 40px; border-radius: 2px; box-shadow: 0 10px 30px rgba(0,0,0,0.04); border: 1px solid var(--border-light); }
         h1 { text-align: center; font-size: 22px; font-weight: 500; letter-spacing: 1px; margin-bottom: 30px; text-transform: uppercase; }
-        .mode-selector {
-            display: flex; justify-content: space-between; margin-bottom: 25px; 
-            border-bottom: 1px solid var(--border-light); padding-bottom: 15px;
-        }
-        .mode-selector label { font-size: 14px; color: var(--text-main); cursor: pointer; display: flex; align-items: center; gap: 6px; }
-        .upload-box { 
-            border: 1px solid var(--border-light); padding: 30px 20px; text-align: center; 
-            margin-bottom: 24px; background-color: var(--bg-color); border-radius: 2px;
-        }
+        .mode-selector { display: flex; justify-content: space-between; margin-bottom: 25px; border-bottom: 1px solid var(--border-light); padding-bottom: 15px; }
+        .mode-selector label { font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+        .upload-box { border: 1px solid var(--border-light); padding: 30px 20px; text-align: center; margin-bottom: 24px; background: var(--bg-color); border-radius: 2px; }
         .upload-box label { font-size: 14px; color: var(--text-muted); display: block; margin-bottom: 15px; }
-        input[type="file"] { font-size: 14px; color: var(--text-main); }
-        button { 
-            width: 100%; padding: 16px; background-color: var(--accent); color: #ffffff; 
-            border: none; border-radius: 2px; font-size: 14px; font-weight: 500; 
-            letter-spacing: 1px; text-transform: uppercase; cursor: pointer; transition: 0.2s ease; 
-        }
+        input[type="file"] { font-size: 14px; }
+        button { width: 100%; padding: 16px; background: var(--accent); color: #fff; border: none; font-size: 14px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; transition: 0.2s; }
         button:hover { opacity: 0.8; }
-        .result { margin-top: 30px; padding: 24px; border: 1px solid var(--border-light); text-align: center; border-radius: 2px; }
-        .result h3 { margin-top: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
-        .valid h3 { color: #111111; }
-        .invalid h3 { color: #888888; }
-        .result p { font-size: 14px; color: var(--text-muted); margin: 8px 0 0 0; line-height: 1.5; }
-        .result strong { color: var(--text-main); font-weight: 600; }
-        .preview { width: 100%; height: auto; margin-top: 24px; border-radius: 2px; border: 1px solid var(--border-light); }
+        .result { margin-top: 30px; padding: 24px; border: 1px solid var(--border-light); text-align: center; }
+        .result h3 { margin-top: 0; font-size: 15px; text-transform: uppercase; }
+        .result p { font-size: 14px; color: var(--text-muted); }
+        .preview { width: 100%; margin-top: 24px; border: 1px solid var(--border-light); }
         .error { color: #d32f2f; text-align: center; margin-top: 20px; font-size: 14px; }
-        
-        /* 3-Column Grid */
         .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 15px; }
-        .stat-box { padding: 15px 10px; border: 1px solid var(--border-light); border-radius: 2px; background: #fafafa; }
+        .stat-box { padding: 15px 10px; border: 1px solid var(--border-light); background: #fafafa; text-align: center;}
         
         #live-section { display: none; text-align: center; margin-top: 20px; }
-        #live-feed { width: 100%; border-radius: 4px; border: 2px solid #000; margin-top: 15px; }
+        #client-video { display: none; } 
+        #live-feed { width: 100%; border-radius: 4px; border: 1px solid var(--border-light); margin-top: 15px; min-height: 300px; background: #eee;}
         .notice { font-size: 12px; color: #d32f2f; margin-top: 15px; }
     </style>
-    
-    <script>
-        function toggleMode() {
-            var mode = document.querySelector('input[name="mode"]:checked').value;
-            var uploadForm = document.getElementById('upload-form-ui');
-            var liveSection = document.getElementById('live-section');
-            var liveFeed = document.getElementById('live-feed');
-            var resultSection = document.getElementById('result-section');
-            
-            if (mode === 'live') {
-                uploadForm.style.display = 'none';
-                liveSection.style.display = 'block';
-                liveFeed.src = "/video_feed"; 
-                if(resultSection) resultSection.style.display = 'none';
-            } else {
-                uploadForm.style.display = 'block';
-                liveSection.style.display = 'none';
-                liveFeed.src = ""; 
-                if(resultSection) resultSection.style.display = 'block';
-            }
-        }
-        window.onload = toggleMode;
-    </script>
 </head>
 <body>
     <div class="container">
         <h1>Analysis</h1>
         
-        <form action="/" method="POST" enctype="multipart/form-data">
+        <form action="/" method="POST" enctype="multipart/form-data" id="main-form">
             <div class="mode-selector">
-                <label>
-                    <input type="radio" name="mode" value="batch" checked onchange="toggleMode()"> 
-                    Batch Upload
-                </label>
-                <label>
-                    <input type="radio" name="mode" value="single" onchange="toggleMode()"> 
-                    Single Bean
-                </label>
-                <label>
-                    <input type="radio" name="mode" value="live" onchange="toggleMode()"> 
-                    Live Camera
-                </label>
+                <label><input type="radio" name="mode" value="batch" checked onchange="toggleMode()"> Batch Upload</label>
+                <label><input type="radio" name="mode" value="single" onchange="toggleMode()"> Single Bean</label>
+                <label><input type="radio" name="mode" value="live" onchange="toggleMode()"> Live Camera</label>
             </div>
 
             <div id="upload-form-ui">
@@ -309,8 +267,16 @@ HTML_TEMPLATE = """
         </form>
 
         <div id="live-section">
-            <p style="color: var(--text-muted); font-size: 14px;">AI real-time analysis active. Position slot under webcam.</p>
-            <img id="live-feed" src="" alt="Awaiting Camera...">
+            <p style="color: var(--text-muted); font-size: 14px;">Live Processing Active. Position slot under webcam.</p>
+            <video id="client-video" autoplay playsinline></video>
+            <canvas id="client-canvas" style="display:none;"></canvas>
+            <img id="live-feed" src="" alt="Requesting Camera Access...">
+            
+            <div class="stat-grid" id="live-stats" style="display:none;">
+                <div class="stat-box"><h3 style="color: #d32f2f; margin:0;" id="st-red">0</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Red</span></div>
+                <div class="stat-box"><h3 style="color: #fbc02d; margin:0;" id="st-yel">0</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Yellow</span></div>
+                <div class="stat-box"><h3 style="color: #2e7d32; margin:0;" id="st-grn">0</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Green</span></div>
+            </div>
         </div>
 
         {% if error_message %}
@@ -322,56 +288,129 @@ HTML_TEMPLATE = """
             {% if result.mode == 'single' %}
                 <div class="result {% if result.is_valid %}valid{% else %}invalid{% endif %}">
                     <h3>{% if result.is_valid %}Match Confirmed{% else %}Invalid Match{% endif %}</h3>
-                    {% if result.is_valid %}
-                        <p>Classification: <strong>{{ result.class_name }}</strong></p>
-                    {% else %}
-                        <p>Object does not match reference parameters.</p>
-                    {% endif %}
+                    <p>Classification: <strong>{{ result.class_name }}</strong></p>
                     <p>Confidence: <strong>{{ result.confidence }}%</strong></p>
                 </div>
-            
             {% elif result.mode == 'batch' %}
                 <div class="result valid">
-                    <h3>AI Batch Analysis Complete</h3>
+                    <h3>Batch Analysis Complete</h3>
                     <p>Total Valid Beans Detected: <strong>{{ result.total }}</strong></p>
-                    
                     <div class="stat-grid">
-                        <div class="stat-box">
-                            <h3 style="color: #d32f2f; margin-bottom: 5px;">{{ result.red }}</h3>
-                            <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Red</span>
-                        </div>
-                        <div class="stat-box">
-                            <h3 style="color: #fbc02d; margin-bottom: 5px;">{{ result.yellow }}</h3>
-                            <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Yellow</span>
-                        </div>
-                        <div class="stat-box">
-                            <h3 style="color: #2e7d32; margin-bottom: 5px;">{{ result.green }}</h3>
-                            <span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Green</span>
-                        </div>
+                        <div class="stat-box"><h3 style="color: #d32f2f; margin-bottom: 5px;">{{ result.red }}</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Red</span></div>
+                        <div class="stat-box"><h3 style="color: #fbc02d; margin-bottom: 5px;">{{ result.yellow }}</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Yellow</span></div>
+                        <div class="stat-box"><h3 style="color: #2e7d32; margin-bottom: 5px;">{{ result.green }}</h3><span style="font-size: 11px; color: var(--text-muted); text-transform: uppercase;">Green</span></div>
                     </div>
-                    
-                    {% if result.invalid > 0 %}
-                        <p class="notice">Note: {{ result.invalid }} object(s) failed verification (Excluded / Invalid).</p>
-                    {% endif %}
                 </div>
             {% endif %}
-
             {% if img_data %}
                 <img class="preview" src="data:image/jpeg;base64,{{ img_data }}" alt="Analyzed Subject">
             {% endif %}
         </div>
         {% endif %}
     </div>
+
+    <!-- Client-Side Camera Logic -->
+    <script>
+        let stream = null;
+        let loopId = null;
+        const video = document.getElementById('client-video');
+        const canvas = document.getElementById('client-canvas');
+        const ctx = canvas.getContext('2d');
+        const liveFeed = document.getElementById('live-feed');
+        const liveStats = document.getElementById('live-stats');
+
+        function toggleMode() {
+            var mode = document.querySelector('input[name="mode"]:checked').value;
+            if (mode === 'live') {
+                document.getElementById('upload-form-ui').style.display = 'none';
+                document.getElementById('live-section').style.display = 'block';
+                if(document.getElementById('result-section')) document.getElementById('result-section').style.display = 'none';
+                startCamera();
+            } else {
+                document.getElementById('upload-form-ui').style.display = 'block';
+                document.getElementById('live-section').style.display = 'none';
+                if(document.getElementById('result-section')) document.getElementById('result-section').style.display = 'block';
+                stopCamera();
+            }
+        }
+
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                video.srcObject = stream;
+                liveStats.style.display = 'grid';
+                loopId = setInterval(processFrame, 500); 
+            } catch (err) {
+                alert("Camera access denied or unavailable.");
+            }
+        }
+
+        function stopCamera() {
+            if (stream) { stream.getTracks().forEach(track => track.stop()); }
+            if (loopId) { clearInterval(loopId); }
+        }
+
+        async function processFrame() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                const dataURL = canvas.toDataURL('image/jpeg', 0.6); 
+                const formData = new FormData();
+                formData.append('frame', dataURL);
+
+                try {
+                    const response = await fetch('/live_frame', { method: 'POST', body: formData });
+                    const result = await response.json();
+                    
+                    if (result.image) {
+                        liveFeed.src = 'data:image/jpeg;base64,' + result.image;
+                        document.getElementById('st-red').innerText = result.red;
+                        document.getElementById('st-yel').innerText = result.yellow;
+                        document.getElementById('st-grn').innerText = result.green;
+                    }
+                } catch (e) {
+                    console.error("Frame dropped:", e);
+                }
+            }
+        }
+
+        window.onload = toggleMode;
+    </script>
 </body>
 </html>
 """
 
 # ==========================================
-# 6. SERVER ROUTES & ROUTING LOGIC
+# 5. SERVER ROUTES & ROUTING LOGIC
 # ==========================================
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_camera_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/live_frame', methods=['POST'])
+def live_frame():
+    data_url = request.form.get('frame')
+    if not data_url:
+        return jsonify({'error': 'No data'})
+        
+    try:
+        header, encoded = data_url.split(",", 1)
+        data = base64.b64decode(encoded)
+        nparr = np.frombuffer(data, np.uint8)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        output_img_bgr, red, yellow, green, invalid = process_coffee_batch_bgr(img_bgr, draw_live_stats=False)
+        
+        _, buffer = cv2.imencode('.jpg', output_img_bgr)
+        img_b64 = base64.b64encode(buffer).decode('utf-8')
+        
+        return jsonify({
+            'image': img_b64,
+            'red': red,
+            'yellow': yellow,
+            'green': green
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -418,7 +457,6 @@ def index():
                 nparr = np.frombuffer(img_bytes, np.uint8)
                 img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
-                # Dark count is no longer captured
                 output_img_bgr, red, yellow, green, invalid = process_coffee_batch_bgr(img_bgr, draw_live_stats=False)
                 
                 output_img_rgb = cv2.cvtColor(output_img_bgr, cv2.COLOR_BGR2RGB)
@@ -445,5 +483,4 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 if __name__ == "__main__":
-    print("\n🌐 Server initialized. Open http://127.0.0.1:5000 in your browser.\n")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
