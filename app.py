@@ -59,7 +59,6 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
     output_img = img_bgr.copy()
     img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     
-    # 1. Isolate objects using Watershed Algorithm
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -81,13 +80,12 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
     cv2.watershed(img_bgr, markers)
     
     red_count, yellow_count, green_count, invalid_count = 0, 0, 0, 0
-    min_bean_area = 200 # Lowered slightly for better live webcam detection
+    min_bean_area = 150 # Adjusted for downscaled fast-camera feed
     
     valid_crops_tensors = []
     boxes = []
     masks = []
     
-    # 2. Extract objects
     for label in np.unique(markers):
         if label == 0 or label == 1 or label == -1:
             continue
@@ -97,7 +95,7 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
         contours, _ = cv2.findContours(bean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if contours:
-            cnt = max(contours, key=cv2.contourArea) # Get the largest contour specifically
+            cnt = max(contours, key=cv2.contourArea) 
             area = cv2.contourArea(cnt)
             
             if area > min_bean_area:
@@ -118,7 +116,6 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
                 boxes.append((x, y, w, h))
                 masks.append(bean_mask)
 
-    # 3. Verify and Draw (Crucial Fix: Handle Render Cloud Memory Drops)
     if len(boxes) > 0:
         if model is not None:
             # --- AI CLASSIFICATION PATH ---
@@ -161,8 +158,6 @@ def process_coffee_batch_bgr(img_bgr, draw_live_stats=False):
 
         else:
             # --- FAILSAFE COLOR PATH ---
-            # If the PyTorch model failed to load (e.g. Render RAM limits), 
-            # gracefully fallback to pure Computer Vision to guarantee boxes are always drawn.
             lower_red1, upper_red1 = np.array([0, 50, 50]), np.array([12, 255, 255])
             lower_red2, upper_red2 = np.array([160, 50, 50]), np.array([179, 255, 255])
             lower_yellow, upper_yellow = np.array([13, 50, 50]), np.array([30, 255, 255])
@@ -309,10 +304,11 @@ HTML_TEMPLATE = """
         {% endif %}
     </div>
 
-    <!-- Client-Side Camera Logic -->
+    <!-- Optimized Client-Side Camera Logic -->
     <script>
         let stream = null;
-        let loopId = null;
+        let isLiveMode = false;
+        let isProcessing = false;
         const video = document.getElementById('client-video');
         const canvas = document.getElementById('client-canvas');
         const ctx = canvas.getContext('2d');
@@ -325,21 +321,28 @@ HTML_TEMPLATE = """
                 document.getElementById('upload-form-ui').style.display = 'none';
                 document.getElementById('live-section').style.display = 'block';
                 if(document.getElementById('result-section')) document.getElementById('result-section').style.display = 'none';
+                isLiveMode = true;
                 startCamera();
             } else {
                 document.getElementById('upload-form-ui').style.display = 'block';
                 document.getElementById('live-section').style.display = 'none';
                 if(document.getElementById('result-section')) document.getElementById('result-section').style.display = 'block';
+                isLiveMode = false;
                 stopCamera();
             }
         }
 
         async function startCamera() {
             try {
-                stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment', width: { ideal: 640 } } 
+                });
                 video.srcObject = stream;
                 liveStats.style.display = 'grid';
-                loopId = setInterval(processFrame, 500); 
+                
+                video.onplaying = () => {
+                    requestAnimationFrame(processFrameLoop);
+                };
             } catch (err) {
                 alert("Camera access denied or unavailable.");
             }
@@ -347,16 +350,24 @@ HTML_TEMPLATE = """
 
         function stopCamera() {
             if (stream) { stream.getTracks().forEach(track => track.stop()); }
-            if (loopId) { clearInterval(loopId); }
         }
 
-        async function processFrame() {
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
+        // Smart Async Loop: Won't send a new frame until the server replies to the previous one
+        async function processFrameLoop() {
+            if (!isLiveMode) return;
+
+            if (!isProcessing && video.readyState === video.HAVE_ENOUGH_DATA) {
+                isProcessing = true;
+                
+                // Downscale frame to a max width of 640px to eliminate network lag
+                const MAX_WIDTH = 640;
+                const scale = Math.min(MAX_WIDTH / video.videoWidth, 1.0);
+                canvas.width = video.videoWidth * scale;
+                canvas.height = video.videoHeight * scale;
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 
-                const dataURL = canvas.toDataURL('image/jpeg', 0.6); 
+                // Compress JPEG heavily to send bytes faster
+                const dataURL = canvas.toDataURL('image/jpeg', 0.5); 
                 const formData = new FormData();
                 formData.append('frame', dataURL);
 
@@ -373,7 +384,11 @@ HTML_TEMPLATE = """
                 } catch (e) {
                     console.error("Frame dropped:", e);
                 }
+                
+                isProcessing = false;
             }
+            
+            requestAnimationFrame(processFrameLoop);
         }
 
         window.onload = toggleMode;
@@ -400,7 +415,7 @@ def live_frame():
         
         output_img_bgr, red, yellow, green, invalid = process_coffee_batch_bgr(img_bgr, draw_live_stats=False)
         
-        _, buffer = cv2.imencode('.jpg', output_img_bgr)
+        _, buffer = cv2.imencode('.jpg', output_img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         img_b64 = base64.b64encode(buffer).decode('utf-8')
         
         return jsonify({
